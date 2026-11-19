@@ -1,0 +1,85 @@
+name: CI
+
+# Clippy and the tests on Linux and macOS for every push to main and every
+# pull request, and a build with the oldest Rust the package claims to
+# support. Changes to the documentation alone are skipped.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE*'
+      - '.gitignore'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The checks only read the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            label: Linux
+          - runner: macos-15
+            label: macOS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runners come with rustup.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  msrv:
+    name: Oldest supported Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version is the package's own `rust-version`.
+      - name: Install Rust
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$version"
+          rustup toolchain install "$version" --profile minimal --no-self-update
+          rustup default "$version"
+          rustc --version
+
+      - name: Build
+        run: cargo build --locked

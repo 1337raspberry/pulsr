@@ -1,0 +1,48 @@
+[package]
+name = "pulsr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A ridge visualiser in the terminal for whatever the computer is playing"
+license = "MIT"
+publish = false
+
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+objc2 = "0.6"
+objc2-core-audio = { version = "0.3", default-features = false, features = [
+    "std",
+    "AudioHardware",
+    "objc2",
+    "objc2-core-audio-types",
+    "objc2-foundation",
+] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
+    "bitflags",
+    "objc2",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "objc2"] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSString",
+    "NSUUID",
+    "NSValue",
+    "NSObject",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pulseaudio = "=0.3.2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug = "line-tables-only"

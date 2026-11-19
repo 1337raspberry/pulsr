@@ -1,0 +1,247 @@
+name: Release
+
+# Builds pulsr for macOS and Linux and attaches the archives to a draft
+# GitHub release, to be looked over and published by hand.
+#
+# Start it by pushing a version tag:
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag has to be the version in Cargo.toml with a `v` in front. A suffix
+# after a hyphen (v0.2.0-rc1) is allowed and marks the release as a
+# pre-release. Running the workflow by hand with a tag builds that tag
+# again and replaces the files on its release.
+#
+# The Linux builds are linked statically against musl, so one file runs on
+# any distribution.
+#
+# The macOS build is signed with a Developer ID certificate and notarised
+# when these repository secrets are set, and left signed ad hoc by the
+# linker when they are not:
+#
+#   MACOS_CERTIFICATE_P12       a Developer ID Application certificate and
+#                               its private key, exported as .p12, in base64
+#   MACOS_CERTIFICATE_PASSWORD  the password the .p12 was exported with
+#   NOTARY_KEY_P8               an App Store Connect API key (.p8), as it
+#                               is or in base64
+#   NOTARY_KEY_ID               that key's ID
+#   NOTARY_ISSUER_ID            the issuer ID shown beside the keys
+#
+# A notarised program on its own cannot have its ticket stapled to it, so
+# macOS asks Apple about it the first time it is run.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'An existing tag to build, such as v0.2.0'
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  draft:
+    name: Draft the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Check the tag against Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          tagged=${TAG#v}
+          if [ "v$tagged" != "$TAG" ] || [ "${tagged%%-*}" != "$version" ]; then
+            echo "::error::tag $TAG does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG is already there; its files will be replaced"
+            exit 0
+          fi
+          prerelease=
+          case "$TAG" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" --draft --verify-tag --generate-notes --title "pulsr ${TAG#v}" $prerelease
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: draft
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `platform` is what the archive is called; `target` is Rust's
+          # own name for the same thing.
+          - platform: macos-apple-silicon
+            target: aarch64-apple-darwin
+            runner: macos-15
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      # The oldest macOS with the audio tap pulsr captures through.
+      MACOSX_DEPLOYMENT_TARGET: '14.2'
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      BINARY: target/${{ matrix.target }}/release/pulsr
+      SIGN: ${{ startsWith(matrix.runner, 'macos') && secrets.MACOS_CERTIFICATE_P12 != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+
+      # The runners come with rustup.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET" --no-self-update
+          rustup default stable
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
+      - name: Build
+        run: cargo build --locked --release --target "$TARGET"
+
+      # In a keychain of its own, made for this run and deleted after it.
+      # The hardened runtime and a secure timestamp are what notarisation
+      # asks of a signature.
+      - name: Sign
+        if: env.SIGN == 'true'
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 24)
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" -k "$keychain" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$identity" ]; then
+            echo "::error::no Developer ID Application identity in MACOS_CERTIFICATE_P12"
+            exit 1
+          fi
+          codesign --force --timestamp --options runtime --identifier com.raspsoft.pulsr \
+            --entitlements macos/entitlements.plist --keychain "$keychain" --sign "$identity" "$BINARY"
+          codesign --verify --strict "$BINARY"
+
+      # Each runner is the machine its target is for, so the binary can be
+      # run where it was built.
+      - name: Check the binary
+        run: |
+          binary="$BINARY"
+          file "$binary"
+          "$binary" -help
+          case "$TARGET" in
+            *-linux-musl)
+              if file "$binary" | grep -q 'dynamically linked'; then
+                echo "::error::the binary is not static"
+                exit 1
+              fi
+              ;;
+          esac
+
+      # Apple looks the program over and records that it may run. What is
+      # sent is a zip holding the signed binary; what ships is the binary
+      # itself, which the record covers.
+      - name: Notarise
+        if: env.SIGN == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          key="$RUNNER_TEMP/notary.p8"
+          case "$NOTARY_KEY_P8" in
+            -----BEGIN*) printf '%s\n' "$NOTARY_KEY_P8" > "$key" ;;
+            *) printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$key" ;;
+          esac
+          ditto -c -k "$BINARY" "$RUNNER_TEMP/pulsr.zip"
+          notary() { xcrun notarytool "$@" --key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"; }
+          notary submit "$RUNNER_TEMP/pulsr.zip" --output-format json > "$RUNNER_TEMP/submitted.json"
+          id=$(plutil -extract id raw "$RUNNER_TEMP/submitted.json")
+          echo "submission $id"
+          # Usually a minute or two. A team's first submissions can take
+          # hours, and waiting those out here is not worth the runner.
+          notary wait "$id" --timeout 10m || true
+          notary info "$id" --output-format json > "$RUNNER_TEMP/info.json"
+          status=$(plutil -extract status raw "$RUNNER_TEMP/info.json")
+          echo "notarisation: $status"
+          case "$status" in
+            Accepted) ;;
+            'In Progress')
+              echo "::error::Apple has not answered yet (submission $id). Run the workflow again for this tag later."
+              exit 1
+              ;;
+            *)
+              notary log "$id" || true
+              echo "::error::the program was not notarised"
+              exit 1
+              ;;
+          esac
+
+      - name: Remove the signing keys
+        if: always() && env.SIGN == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/notary.p8"
+
+      - name: Package
+        run: |
+          name="pulsr-${TAG#v}-$PLATFORM"
+          mkdir "$name"
+          cp "$BINARY" README.md "$name/"
+          if [ -f LICENSE ]; then cp LICENSE "$name/"; fi
+          tar -czf "$name.tar.gz" "$name"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          else
+            shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+          cat "$name.tar.gz.sha256"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber

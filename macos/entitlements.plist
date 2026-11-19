@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The hardened runtime, which notarisation requires, keeps a program
+	     from audio input through Core Audio unless it claims this. The
+	     tap on what the system is playing is read as an input device. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>
