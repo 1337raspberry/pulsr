@@ -30,6 +30,9 @@ pub struct RidgeParams {
     pub ridge_row_ms: f64,
     /// Pixels the newest history row must have moved off the live row before it is drawn.
     pub ridge_emerge: f64,
+    /// The live row rises with the stack from a row below the front baseline, and is
+    /// cut into the history as it reaches it, instead of standing on the baseline.
+    pub ridge_rising: bool,
     /// Sigma in points of the bell each peak is spread into, before `ridge_smooth`; 0 is off.
     pub ridge_spread: f64,
     /// Neighbour blend applied to each point, 0...1; 0 is identity.
@@ -68,6 +71,7 @@ impl Default for RidgeParams {
             ridge_fade_curve: 0.75,
             ridge_row_ms: 33.0,
             ridge_emerge: 1.0,
+            ridge_rising: false,
             ridge_spread: 1.0,
             ridge_smooth: 0.1,
             ridge_grain: 0.03,

@@ -31,6 +31,9 @@ Draws what the computer is playing as a ridge, in the terminal.
 
   -full         take the whole screen, and give it back on quitting (by
                 default the ridge is drawn in the lines below the prompt)
+  -rising       the front row, which follows the sound as it plays, rises
+                from below the bottom edge with the rest instead of standing
+                on it
   -theme NAME   the colours: terminal (the terminal's own text colour
                 on its own background, the default) or one of
                 greyscale, catppuccin-macchiato, catppuccin-mocha,
@@ -68,7 +71,8 @@ Draws what the computer is playing as a ridge, in the terminal.
 
 The settings to start with can be kept in ~/.config/pulsr/config (or
 under $XDG_CONFIG_HOME), as lines like theme = nord. They are theme, gradient,
-mode, full (true or false), fps, lines, pitch, height, fade and curve.
+mode, full and rising (true or false), fps, lines, pitch, height, fade and
+curve.
 What the keys last chose is saved on quitting, in the file state beside
 it, and the next run starts from there; of the two files the one written
 later is gone by. An option given here wins over both. Themes of your own go in
@@ -80,7 +84,8 @@ themes/NAME.theme adds a theme called NAME. A line of each kind:
   gradient atomic = #1f6f4a #39d98a #b8fff0
 
 Keys: Q quits, F switches full screen on and off, T moves to the next
-theme, G to the next gradient, M to the other characters. [ and ] move
+theme, G to the next gradient, M to the other characters, R lets the
+front row rise from below the edge or stand on it. [ and ] move
 the rows closer together and further apart, - and + lower and raise the
 frames a second, , and . the height of the stack, ; and ' the fade, 9
 and 0 its curve.";
@@ -242,6 +247,8 @@ pub struct Options {
     seconds: Option<f64>,
     stats: bool,
     full: bool,
+    /// The front row rises from below the bottom edge instead of standing on it.
+    rising: bool,
     theme: Theme,
     /// `None` is the theme's first.
     gradient: Option<String>,
@@ -254,7 +261,8 @@ pub struct Options {
     config_dir: Option<std::path::PathBuf>,
 }
 
-const SETTINGS: [&str; 10] = ["theme", "gradient", "mode", "full", "fps", "lines", "pitch", "height", "fade", "curve"];
+const SETTINGS: [&str; 11] =
+    ["theme", "gradient", "mode", "full", "rising", "fps", "lines", "pitch", "height", "fade", "curve"];
 
 impl Options {
     /// Parses the arguments after the program's name over the configuration directory's
@@ -282,6 +290,7 @@ impl Options {
             seconds: None,
             stats: false,
             full: false,
+            rising: false,
             theme: Theme::terminal(),
             gradient: None,
             themes,
@@ -305,6 +314,7 @@ impl Options {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-full" => options.full = true,
+                "-rising" => options.rising = true,
                 "-testtone" => options.test_tone = true,
                 "-stats" => options.stats = true,
                 "-theme" | "-gradient" | "-mode" | "-fps" | "-lines" | "-pitch" | "-height" | "-fade" | "-curve"
@@ -354,7 +364,7 @@ impl Options {
             self.gradient = saved("gradient").filter(|name| theme.gradient_index(name).is_some()).map(str::to_string);
             self.theme = theme;
         }
-        for key in ["mode", "full", "fps", "pitch", "height", "fade", "curve"] {
+        for key in ["mode", "full", "rising", "fps", "pitch", "height", "fade", "curve"] {
             if let Some(value) = saved(key) {
                 let _ = self.set(key, value);
             }
@@ -370,17 +380,17 @@ impl Options {
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .ok_or("needs a positive number".to_string())
         };
+        let switch = || match value {
+            "true" | "yes" | "on" => Ok(true),
+            "false" | "no" | "off" => Ok(false),
+            _ => Err("needs true or false".to_string()),
+        };
         match key {
             "theme" => self.theme = self.themes.load(value).map_err(|problem| format!("finds {problem}"))?,
             "gradient" => self.gradient = Some(value.to_string()),
             "mode" => self.mode = Some(Mode::named(value).ok_or("needs octant or braille")?),
-            "full" => {
-                self.full = match value {
-                    "true" | "yes" | "on" => true,
-                    "false" | "no" | "off" => false,
-                    _ => return Err("needs true or false".to_string()),
-                }
-            }
+            "full" => self.full = switch()?,
+            "rising" => self.rising = switch()?,
             "fps" => self.fps = number()?.clamp(MIN_FPS, 1000.0),
             "lines" => self.lines = Some(number()?.round().clamp(2.0, 10_000.0) as u16),
             "pitch" => self.pitch = number()?.max(1.0),
@@ -451,6 +461,7 @@ impl Stage {
             // The front row stands on the last line of dots.
             ridge_bottom: 0.0,
             ridge_emerge: EMERGE_DOTS,
+            ridge_rising: options.rising,
             ..RidgeParams::default()
         };
         options.set_fade(&mut params);
@@ -682,6 +693,15 @@ pub fn run(mut options: Options) -> i32 {
                     state.insert("full".to_string(), full.to_string());
                     state_changed = true;
                     restage = true;
+                    continue;
+                }
+                b'r' => {
+                    options.rising = !options.rising;
+                    state.insert("rising".to_string(), options.rising.to_string());
+                    state_changed = true;
+                    stage.ridge.params.ridge_rising = options.rising;
+                    figure = Some(format!("front row {}", if options.rising { "rising" } else { "standing" }));
+                    status_until = now + STATUS_SECONDS;
                     continue;
                 }
                 b't' => {

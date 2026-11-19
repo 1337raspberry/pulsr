@@ -59,18 +59,19 @@ pub fn place(frame: &RidgeFrame<'_>, target: RidgeTarget, out: &mut Vec<RowPlace
         out.push(RowPlacement { row, baseline, rise: g.scale * scale, alpha: g.alpha, floor: None });
     };
 
-    // Front to back first. The live row stands still.
-    append(0, 0.0, front);
+    // Front to back first. The live row stands still, or rises a slot ahead of the
+    // newest history row.
+    let span = (rows.max(2) - 1) as f64;
+    let phase = frame.phase.clamp(0.0, 1.0);
+    let shift = js_round(phase * pitch);
+    append(0, 0.0, if p.ridge_rising { front + pitch - shift } else { front });
     if rows > 1 {
-        let span = (rows - 1) as f64;
-        let phase = frame.phase.clamp(0.0, 1.0);
-        let shift = js_round(phase * pitch);
         for j in 0..frame.history.rows() {
             let depth = (j as f64 + phase) / span;
             if depth > 1.0 {
                 break;
             }
-            if j == 0 && shift < p.ridge_emerge {
+            if !p.ridge_rising && j == 0 && shift < p.ridge_emerge {
                 continue;
             }
             append(j + 1, depth, front - j as f64 * pitch - shift);
@@ -133,6 +134,28 @@ mod tests {
     /// Pixels the stack moved between two paints, across a cut or not.
     fn step(from: f64, to: f64) -> f64 {
         (to - from).rem_euclid(PITCH)
+    }
+
+    #[test]
+    fn a_rising_live_row_stays_a_slot_ahead_of_the_newest_history_row() {
+        let params = RidgeParams { ridge_rising: true, ..RidgeParams::default() };
+        let mut ridge = Ridge::new(params, 1);
+        ridge.keep_moving = true;
+        let mut placements = Vec::new();
+        let mut standing = Vec::new();
+        for i in 1..=240 {
+            let now = 50.0 + f64::from(i) / 120.0;
+            assert!(ridge.advance(now, Some(&Flat), TARGET.height()));
+            let mut frame = ridge.frame(now).unwrap();
+            place(&frame, TARGET, &mut placements);
+            frame.layout.ridge_rising = false;
+            place(&frame, TARGET, &mut standing);
+            let front = standing.last().unwrap().baseline;
+            let [.., newest, live] = placements.as_slice() else { panic!() };
+            assert_eq!((newest.row, live.row), (1, 0));
+            assert_eq!(live.baseline - newest.baseline, PITCH);
+            assert!(live.baseline >= front && live.baseline <= front + PITCH);
+        }
     }
 
     #[test]
