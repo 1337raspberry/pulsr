@@ -27,7 +27,7 @@ pulsr
 
 play some music. `q` to quit. `pulsr -help` for the rest
 
-on macos it asks for audio capture permission the first time. say yes or enjoy a flat line that does nothing
+on macos your terminal will ask for audio capture permission the first time. say yes or enjoy a flat line that does nothing
 
 some other hotkeys to play around with:
 
