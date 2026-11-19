@@ -1,6 +1,6 @@
 # pulsr
 
-<img width="581" height="936" alt="Screenshot 2026-11-19 at 11 45 36" src="https://github.com/user-attachments/assets/5590f8db-c196-4b1a-8fbc-d71b351e6518" />
+<img width="970" height="639" alt="pulsr-loop" src="https://github.com/user-attachments/assets/d93610ef-6ae7-4d9c-a191-7de5c0c6db95" />
 
 
 it makes squiggly pulsar lines out of whatever your computer is playing. in your terminal.
