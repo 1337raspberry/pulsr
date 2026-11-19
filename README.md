@@ -31,13 +31,15 @@ on macos your terminal will ask for audio capture permission the first time. say
 
 some other hotkeys to play around with:
 
-f - toggle fullscreen
+f - toggle "fullscreen" eg hide your command prompt
 
 m - toggle mode (octant or braille)
 
 t - cycle theme
 
 g - cycle gradient colours
+
+r - toggle rising mode (no static bottom line)
 
 -/+ - change fps
 
