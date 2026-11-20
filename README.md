@@ -17,7 +17,7 @@ inspired by the visualiser in [plexamp](https://www.plex.tv/en-gb/plexamp/) and 
 brew install 1337raspberry/tap/pulsr
 ```
 
-or grab a build from releases and put it in your path somewhere. or `cargo build --release` if you are like that.
+or grab a build from releases and put it in your path somewhere (on macos stick with brew, a build downloaded in a browser gets blocked by gatekeeper). or `cargo build --release` if you are like that.
 
 ## use it
 
