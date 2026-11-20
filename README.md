@@ -33,7 +33,7 @@ some other hotkeys to play around with:
 
 f - toggle "fullscreen" eg hide your command prompt
 
-m - toggle mode (octant or braille)
+m - toggle mode (octant/braille/ascii flat/ascii static) (static isn't a good name for that i am realising, i mean static as in, TV static. o h well)
 
 t - cycle theme
 
