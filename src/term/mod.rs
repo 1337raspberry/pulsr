@@ -1,7 +1,9 @@
 //! The terminal front end: the ridge drawn as characters, in the lines below the prompt
 //! or over the whole screen. Each frame is rasterised into dots (`raster`) and written as
-//! characters (`cells`, `theme`). A timer paces the loop; the ridge moves by elapsed time.
+//! characters (`cells`, `theme`), or drawn straight into ASCII cells (`ascii`). A timer
+//! paces the loop; the ridge moves by elapsed time.
 
+mod ascii;
 mod cells;
 mod config;
 mod octants;
@@ -34,6 +36,8 @@ Draws what the computer is playing as a ridge, in the terminal.
   -rising       the front row, which follows the sound as it plays, rises
                 from below the bottom edge with the rest instead of standing
                 on it
+  -settle       in silence the rows settle and stop, instead of
+                scrolling on
   -theme NAME   the colours: terminal (the terminal's own text colour
                 on its own background, the default) or one of
                 greyscale, catppuccin-macchiato, catppuccin-mocha,
@@ -47,16 +51,22 @@ Draws what the computer is playing as a ridge, in the terminal.
                 flat rows to the peaks: the theme's first by default; each
                 theme has its own, and all have text (the theme's text
                 colour throughout). The G key shows their names
-  -mode MODE    the characters the dots are drawn with:
+  -mode MODE    the characters the ridge is drawn with:
                   octant      solid dots (the default in terminals known
                               to have them)
                   braille     separated dots (the default elsewhere; in
                               nearly every font)
+                  static      plain ASCII: dashes with gaps that drift
+                              along the rows, heavier on the peaks
+                  line        plain ASCII: an unbroken line
   -testtone     analyse a synthetic signal instead of the system's audio
   -fps N        frames a second (60 by default)
   -lines N      terminal lines to draw in when not full screen (all but
                 one by default)
-  -pitch N      dots between rows (5 by default)
+  -pitch N      dots between rows in octant and braille (5 by default);
+                a character cell is 4 dots tall
+  -ascii-pitch N
+                the same for static and line (10 by default)
   -height N     how far up the lines the stack reaches, as a percentage
                 (90 by default)
   -fade N       how far the rows fade toward the back, as a percentage:
@@ -71,8 +81,8 @@ Draws what the computer is playing as a ridge, in the terminal.
 
 The settings to start with can be kept in ~/.config/pulsr/config (or
 under $XDG_CONFIG_HOME), as lines like theme = nord. They are theme, gradient,
-mode, full and rising (true or false), fps, lines, pitch, height, fade and
-curve.
+mode, full, rising and settle (true or false), fps, lines, pitch,
+ascii-pitch, height, fade and curve.
 What the keys last chose is saved on quitting, in the file state beside
 it, and the next run starts from there; of the two files the one written
 later is gone by. An option given here wins over both. Themes of your own go in
@@ -84,26 +94,40 @@ themes/NAME.theme adds a theme called NAME. A line of each kind:
   gradient atomic = #1f6f4a #39d98a #b8fff0
 
 Keys: Q quits, F switches full screen on and off, T moves to the next
-theme, G to the next gradient, M to the other characters, R lets the
-front row rise from below the edge or stand on it. [ and ] move
+theme, G to the next gradient, M to the next characters, R lets the
+front row rise from below the edge or stand on it, S lets the rows
+settle and stop in silence or scroll on. [ and ] move
 the rows closer together and further apart, - and + lower and raise the
 frames a second, , and . the height of the stack, ; and ' the fade, 9
 and 0 its curve.";
 
-/// The characters the dots are drawn with.
+/// The characters the ridge is drawn with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Octant,
     Braille,
+    Static,
+    Line,
 }
 
 impl Mode {
-    const ALL: [Self; 2] = [Self::Octant, Self::Braille];
+    const ALL: [Self; 4] = [Self::Octant, Self::Braille, Self::Static, Self::Line];
 
     fn name(self) -> &'static str {
         match self {
             Self::Octant => "octant",
             Self::Braille => "braille",
+            Self::Static => "static",
+            Self::Line => "line",
+        }
+    }
+
+    /// The look of an ASCII mode; `None` for the modes drawn in dots.
+    fn look(self) -> Option<ascii::Look> {
+        match self {
+            Self::Octant | Self::Braille => None,
+            Self::Static => Some(ascii::Look::Static),
+            Self::Line => Some(ascii::Look::Line),
         }
     }
 
@@ -127,8 +151,10 @@ impl Mode {
 const DEFAULT_FPS: f64 = 60.0;
 /// Below this a frame takes longer than the ridge allows before it counts as a stall.
 const MIN_FPS: f64 = 5.0;
-/// Dots between rows.
+/// Dots between rows: in the modes drawn in dots, and in the ASCII modes, whose rows
+/// need more than a cell (4 dots) between them.
 const DEFAULT_PITCH: f64 = 5.0;
+const DEFAULT_ASCII_PITCH: f64 = 10.0;
 /// The fewest and most dots between rows the keys go to.
 const KEY_PITCH: (f64, f64) = (2.0, 24.0);
 /// The frame rates the keys step through.
@@ -239,7 +265,9 @@ pub struct Options {
     test_tone: bool,
     fps: f64,
     lines: Option<u16>,
+    /// Dots between rows, in the modes drawn in dots and in the ASCII modes.
     pitch: f64,
+    ascii_pitch: f64,
     /// Percentages, and the fade's exponent.
     height: f64,
     fade: f64,
@@ -249,6 +277,8 @@ pub struct Options {
     full: bool,
     /// The front row rises from below the bottom edge instead of standing on it.
     rising: bool,
+    /// In silence the rows come to rest instead of scrolling on.
+    settle: bool,
     theme: Theme,
     /// `None` is the theme's first.
     gradient: Option<String>,
@@ -261,8 +291,22 @@ pub struct Options {
     config_dir: Option<std::path::PathBuf>,
 }
 
-const SETTINGS: [&str; 11] =
-    ["theme", "gradient", "mode", "full", "rising", "fps", "lines", "pitch", "height", "fade", "curve"];
+const SETTINGS: [&str; 13] =
+    [
+    "theme",
+    "gradient",
+    "mode",
+    "full",
+    "rising",
+    "settle",
+    "fps",
+    "lines",
+    "pitch",
+    "ascii-pitch",
+    "height",
+    "fade",
+    "curve",
+];
 
 impl Options {
     /// Parses the arguments after the program's name over the configuration directory's
@@ -284,6 +328,7 @@ impl Options {
             fps: DEFAULT_FPS,
             lines: None,
             pitch: DEFAULT_PITCH,
+            ascii_pitch: DEFAULT_ASCII_PITCH,
             height: DEFAULT_HEIGHT,
             fade: DEFAULT_FADE,
             curve: DEFAULT_CURVE,
@@ -291,6 +336,7 @@ impl Options {
             stats: false,
             full: false,
             rising: false,
+            settle: false,
             theme: Theme::terminal(),
             gradient: None,
             themes,
@@ -315,10 +361,11 @@ impl Options {
             match arg.as_str() {
                 "-full" => options.full = true,
                 "-rising" => options.rising = true,
+                "-settle" => options.settle = true,
                 "-testtone" => options.test_tone = true,
                 "-stats" => options.stats = true,
-                "-theme" | "-gradient" | "-mode" | "-fps" | "-lines" | "-pitch" | "-height" | "-fade" | "-curve"
-                | "-seconds" => {
+                "-theme" | "-gradient" | "-mode" | "-fps" | "-lines" | "-pitch" | "-ascii-pitch" | "-height"
+                | "-fade" | "-curve" | "-seconds" => {
                     let value = args.next().ok_or(format!("{arg} needs a value"))?;
                     options.set(&arg[1..], &value).map_err(|problem| format!("{arg} {problem}"))?;
                     theme_chosen |= arg == "-theme";
@@ -364,7 +411,7 @@ impl Options {
             self.gradient = saved("gradient").filter(|name| theme.gradient_index(name).is_some()).map(str::to_string);
             self.theme = theme;
         }
-        for key in ["mode", "full", "rising", "fps", "pitch", "height", "fade", "curve"] {
+        for key in ["mode", "full", "rising", "settle", "fps", "pitch", "ascii-pitch", "height", "fade", "curve"] {
             if let Some(value) = saved(key) {
                 let _ = self.set(key, value);
             }
@@ -388,12 +435,14 @@ impl Options {
         match key {
             "theme" => self.theme = self.themes.load(value).map_err(|problem| format!("finds {problem}"))?,
             "gradient" => self.gradient = Some(value.to_string()),
-            "mode" => self.mode = Some(Mode::named(value).ok_or("needs octant or braille")?),
+            "mode" => self.mode = Some(Mode::named(value).ok_or("needs octant, braille, static or line")?),
             "full" => self.full = switch()?,
             "rising" => self.rising = switch()?,
+            "settle" => self.settle = switch()?,
             "fps" => self.fps = number()?.clamp(MIN_FPS, 1000.0),
             "lines" => self.lines = Some(number()?.round().clamp(2.0, 10_000.0) as u16),
             "pitch" => self.pitch = number()?.max(1.0),
+            "ascii-pitch" => self.ascii_pitch = number()?.max(1.0),
             "height" => self.height = number()?.clamp(HEIGHT_RANGE.0, HEIGHT_RANGE.1),
             "fade" => {
                 self.fade = value
@@ -423,6 +472,11 @@ impl Options {
 }
 
 impl Options {
+    /// The setting that holds the dots between rows for `mode`, and its value.
+    fn pitch(&self, mode: Mode) -> (&'static str, f64) {
+        if mode.look().is_some() { ("ascii-pitch", self.ascii_pitch) } else { ("pitch", self.pitch) }
+    }
+
     /// Gives `params` the fade toward the back that was asked for.
     fn set_fade(&self, params: &mut RidgeParams) {
         params.ridge_back_alpha = params.ridge_alpha * (1.0 - self.fade / 100.0);
@@ -444,11 +498,14 @@ struct Stage {
     target: RidgeTarget,
     ridge: Ridge,
     canvas: Canvas,
+    /// The same lines as whole cells, for the ASCII modes.
+    grid: ascii::Grid,
 }
 
 impl Stage {
-    /// Over the whole screen when `full`, else over the lines asked for.
-    fn new(options: &Options, size: tty::Size, full: bool, seed: u64) -> Self {
+    /// Over the whole screen when `full`, else over the lines asked for, with the rows
+    /// spaced for `mode`.
+    fn new(options: &Options, mode: Mode, size: tty::Size, full: bool, seed: u64) -> Self {
         let lines = if full { size.rows } else { options.lines.unwrap_or(size.rows.saturating_sub(1)) };
         let lines = lines.clamp(2, size.rows.max(2));
         let (across, down) = cells::CELL_DOTS;
@@ -465,15 +522,16 @@ impl Stage {
             ..RidgeParams::default()
         };
         options.set_fade(&mut params);
-        let rows = dot_rows(height, options.pitch, &params);
+        let rows = dot_rows(height, options.pitch(mode).1, &params);
         params.ridge_rows = rows;
         params.ridge_row_ms = STACK_MS / (rows - 1) as f64;
         let mut ridge = Ridge::new(params, seed);
-        ridge.keep_moving = true;
+        ridge.keep_moving = !options.settle;
         // One dot to the point, so the layout's pixels are dots.
         let target = RidgeTarget { pixel_width: width, pixel_height: height, scale: 1.0 };
         let canvas = Canvas::new(width as usize, height as usize);
-        Self { size, lines, target, ridge, canvas }
+        let grid = ascii::Grid::new(usize::from(size.cols), usize::from(lines));
+        Self { size, lines, target, ridge, canvas, grid }
     }
 }
 
@@ -649,10 +707,10 @@ pub fn run(mut options: Options) -> i32 {
     // Every octant only where the terminal is known to draw them all.
     let octant = match terminal {
         Mode::Octant => cells::Style::octants(),
-        Mode::Braille => cells::Style::cautious_octants(),
+        _ => cells::Style::cautious_octants(),
     };
     let braille = cells::Style::braille();
-    let mut stage = Stage::new(&options, size, full, clock::now().to_bits());
+    let mut stage = Stage::new(&options, mode, size, full, clock::now().to_bits());
     let mut builder = GeometryBuilder::default();
     let mut list = DrawList::default();
     let mut timings = Timings::default();
@@ -682,7 +740,10 @@ pub fn run(mut options: Options) -> i32 {
                 b'm' => {
                     let at = Mode::ALL.iter().position(|other| *other == mode).unwrap_or(0);
                     report.extend(timings.line(mode, &stage, now - mode_started));
-                    mode = Mode::ALL[(at + 1) % Mode::ALL.len()];
+                    let next = Mode::ALL[(at + 1) % Mode::ALL.len()];
+                    // The ASCII modes have their own dots between rows.
+                    restage |= next.look().is_some() != mode.look().is_some();
+                    mode = next;
                     state.insert("mode".to_string(), mode.name().to_string());
                     state_changed = true;
                     timings = Timings::default();
@@ -704,6 +765,16 @@ pub fn run(mut options: Options) -> i32 {
                     status_until = now + STATUS_SECONDS;
                     continue;
                 }
+                b's' => {
+                    options.settle = !options.settle;
+                    state.insert("settle".to_string(), options.settle.to_string());
+                    state_changed = true;
+                    stage.ridge.keep_moving = !options.settle;
+                    let rows = if options.settle { "settle" } else { "scroll on" };
+                    figure = Some(format!("in silence the rows {rows}"));
+                    status_until = now + STATUS_SECONDS;
+                    continue;
+                }
                 b't' => {
                     theme = options.themes.next(&theme);
                     gradient = 0;
@@ -711,11 +782,17 @@ pub fn run(mut options: Options) -> i32 {
                 b'g' => gradient = (gradient + 1) % theme.gradients.len(),
                 b'[' | b']' => {
                     let step = if key == b']' { 1.0 } else { -1.0 };
-                    options.pitch = (options.pitch.round() + step).clamp(KEY_PITCH.0, KEY_PITCH.1);
-                    state.insert("pitch".to_string(), options.pitch.to_string());
+                    let (setting, pitch) = options.pitch(mode);
+                    let pitch = (pitch.round() + step).clamp(KEY_PITCH.0, KEY_PITCH.1);
+                    if mode.look().is_some() {
+                        options.ascii_pitch = pitch;
+                    } else {
+                        options.pitch = pitch;
+                    }
+                    state.insert(setting.to_string(), pitch.to_string());
                     state_changed = true;
                     restage = true;
-                    figure = Some(format!("{} dots between rows", options.pitch));
+                    figure = Some(format!("{pitch} dots between rows"));
                     status_until = now + STATUS_SECONDS;
                     continue;
                 }
@@ -774,7 +851,7 @@ pub fn run(mut options: Options) -> i32 {
             if let Some(new) = resized {
                 size = new;
             }
-            stage = Stage::new(&options, size, full, now.to_bits());
+            stage = Stage::new(&options, mode, size, full, now.to_bits());
             out.clear();
             screen.show(&stage, full, resized.is_some(), &mut out);
             tty::write_all(&out);
@@ -794,7 +871,10 @@ pub fn run(mut options: Options) -> i32 {
         builder.build(frame.as_ref(), stage.target, &mut list);
         let built = clock::now();
 
-        stage.canvas.draw(&list, DOT_HALF_WIDTH);
+        match mode.look() {
+            Some(look) => stage.grid.draw(&list, look, now),
+            None => stage.canvas.draw(&list, DOT_HALF_WIDTH),
+        }
         let drawn = clock::now();
 
         // Synchronised output: the terminal holds its repaint between the two marks.
@@ -807,11 +887,11 @@ pub fn run(mut options: Options) -> i32 {
             backdrop: theme.background.unwrap_or(terminal_backdrop),
             background: theme.background,
         };
-        let style = match mode {
-            Mode::Octant => &octant,
-            Mode::Braille => &braille,
-        };
-        cells::encode(&stage.canvas, style, &paint, &mut out);
+        match mode {
+            Mode::Octant => cells::encode(&stage.canvas, &octant, &paint, &mut out),
+            Mode::Braille => cells::encode(&stage.canvas, &braille, &paint, &mut out),
+            Mode::Static | Mode::Line => stage.grid.encode(&paint, &mut out),
+        }
         // A notice lies over the top line, which the next frame redraws.
         if now < status_until {
             let status = figure
@@ -1025,14 +1105,14 @@ mod tests {
     #[test]
     fn the_height_and_the_fade_reach_the_ridge() {
         let options = parse(&["-height", "100", "-fade", "40", "-curve", "2"]).unwrap();
-        let stage = Stage::new(&options, tty::Size { cols: 80, rows: 30 }, true, 1);
+        let stage = Stage::new(&options, Mode::Octant, tty::Size { cols: 80, rows: 30 }, true, 1);
         let params = &stage.ridge.params;
         assert_eq!((params.ridge_height, params.ridge_fade_curve), (1.0, 2.0));
         assert!((params.ridge_back_alpha - params.ridge_alpha * 0.6).abs() < 1e-9);
 
         let options = parse(&[]).unwrap();
         assert_eq!((options.height, options.fade, options.curve), (DEFAULT_HEIGHT, DEFAULT_FADE, DEFAULT_CURVE));
-        let stage = Stage::new(&options, tty::Size { cols: 80, rows: 30 }, true, 1);
+        let stage = Stage::new(&options, Mode::Octant, tty::Size { cols: 80, rows: 30 }, true, 1);
         let params = &stage.ridge.params;
         assert_eq!(params.ridge_height, 0.9);
         assert!((params.ridge_back_alpha - params.ridge_alpha * 0.2).abs() < 1e-9);
@@ -1129,6 +1209,36 @@ mod tests {
     }
 
     #[test]
+    fn the_rows_scroll_through_silence_unless_asked_to_settle() {
+        let size = tty::Size { cols: 80, rows: 24 };
+        let stage = |options: &Options| Stage::new(options, Mode::Octant, size, false, 1);
+        assert!(stage(&parse(&[]).unwrap()).ridge.keep_moving);
+        assert!(!stage(&parse(&["-settle"]).unwrap()).ridge.keep_moving);
+        assert!(!stage(&over(settings(&[("settle", "true")]), &[]).unwrap()).ridge.keep_moving);
+    }
+
+    #[test]
+    fn the_ascii_modes_keep_their_own_spacing_of_the_rows() {
+        let size = tty::Size { cols: 80, rows: 41 };
+        let rows = |options: &Options, mode: Mode| Stage::new(options, mode, size, true, 1).ridge.row_count();
+        // 164 dots, 90% of them the stack: a row every 5 dots, or every 10.
+        let options = parse(&[]).unwrap();
+        assert_eq!((options.pitch, options.ascii_pitch), (DEFAULT_PITCH, DEFAULT_ASCII_PITCH));
+        assert_eq!((rows(&options, Mode::Octant), rows(&options, Mode::Braille)), (31, 31));
+        assert_eq!((rows(&options, Mode::Static), rows(&options, Mode::Line)), (16, 16));
+        // Each is set and saved under its own name.
+        let saved = || {
+            let state = [("pitch", "4"), ("ascii-pitch", "12")];
+            let state = state.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect();
+            Config { state, state_is_newer: true, ..Config::default() }
+        };
+        assert_eq!(over(saved(), &[]).unwrap().pitch(Mode::Static), ("ascii-pitch", 12.0));
+        let options = over(saved(), &["-ascii-pitch", "8"]).unwrap();
+        assert_eq!(options.pitch(Mode::Braille), ("pitch", 4.0));
+        assert_eq!(options.pitch(Mode::Line), ("ascii-pitch", 8.0));
+    }
+
+    #[test]
     fn every_mode_is_reached_by_its_name() {
         for mode in Mode::ALL {
             assert_eq!(Mode::named(mode.name()), Some(mode));
@@ -1171,7 +1281,7 @@ mod tests {
     fn canvas_after_a_tone() -> (Stage, Canvas) {
         let size = tty::Size { cols: 120, rows: 40 };
         let options = parse(&[]).unwrap();
-        let mut stage = Stage::new(&options, size, false, 1);
+        let mut stage = Stage::new(&options, Mode::Octant, size, false, 1);
         let mut now = 5.0;
         for _ in 0..120 {
             now += 1.0 / 60.0;
@@ -1222,7 +1332,7 @@ mod tests {
     fn a_full_screen_stage_takes_every_line() {
         let size = tty::Size { cols: 120, rows: 40 };
         let options = parse(&["-lines", "10"]).unwrap();
-        assert_eq!(Stage::new(&options, size, false, 1).lines, 10);
-        assert_eq!(Stage::new(&options, size, true, 1).lines, 40);
+        assert_eq!(Stage::new(&options, Mode::Octant, size, false, 1).lines, 10);
+        assert_eq!(Stage::new(&options, Mode::Octant, size, true, 1).lines, 40);
     }
 }

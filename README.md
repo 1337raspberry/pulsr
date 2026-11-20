@@ -5,7 +5,7 @@
 
 it makes squiggly pulsar lines out of whatever your computer is playing. in your terminal.
 
-its very responsive and fun to look at if you enjoy jingly keys and bouncing visualisers as i do. it has many standard community colour schemes built in and it supports custom ones too. it supports standard braille characters to work in every terminal i've tested so far, and it also supports octant rendering on modern terminals for a smooth line
+its very responsive and fun to look at if you enjoy jingly keys and bouncing visualisers as i do. it has many standard community colour schemes built in and it supports custom ones too. it supports standard braille or ASCII characters to work in every terminal i've tested so far, and it also supports octant rendering on modern terminals for a smooth line
 
 written in rust. macos (apple silicon, 14.2+) and linux (pulseaudio or pipewire).
 
@@ -40,6 +40,8 @@ t - cycle theme
 g - cycle gradient colours
 
 r - toggle rising mode (no static bottom line)
+
+s - toggle settle mode (no music playing = motion stops)
 
 -/+ - change fps
 

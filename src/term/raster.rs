@@ -135,6 +135,7 @@ mod tests {
             // Every test row rests on y 10 and rises 10 at full scale.
             baseline: 10.0,
             rise: 10.0,
+            id: 0,
         });
     }
 

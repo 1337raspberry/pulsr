@@ -77,7 +77,7 @@ pub struct Paint<'a> {
 
 impl Paint<'_> {
     /// The colour of a cell whose brightest dot is `brightness` at `level`.
-    fn colour(&self, brightness: f32, level: f32, curve: f32) -> Rgb {
+    pub(super) fn colour(&self, brightness: f32, level: f32, curve: f32) -> Rgb {
         let strength = if self.full > 0.0 { (brightness / self.full).min(1.0).powf(curve) } else { 1.0 };
         let along = if self.top_level > 0.0 { level / self.top_level } else { 0.0 };
         mix(self.backdrop, self.gradient.at(along), strength)

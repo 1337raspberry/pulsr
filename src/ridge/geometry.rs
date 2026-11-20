@@ -36,7 +36,13 @@ pub struct RowDraw {
     /// Y of the row's resting line, and the pixels a full-scale point rises above it.
     pub baseline: f32,
     pub rise: f32,
+    /// Identifies the row's levels; unchanged as the row moves back through the stack.
+    /// A live row that stands still keeps `STANDING_ID`.
+    pub id: u64,
 }
+
+/// The id of a live row that stands on the front baseline.
+const STANDING_ID: u64 = u64::MAX;
 
 /// Everything one frame of the ridge draws, rows back to front. Reused between frames.
 #[derive(Default)]
@@ -93,6 +99,11 @@ impl GeometryBuilder {
                 segments: segment_start..list.segments.len() as u32,
                 baseline: place.baseline as f32,
                 rise: place.rise as f32,
+                id: if place.row == 0 && !p.ridge_rising {
+                    STANDING_ID
+                } else {
+                    frame.cuts.wrapping_sub(place.row as u64)
+                },
             });
         }
     }
@@ -146,6 +157,39 @@ mod tests {
                 *level = if i % 64 == 20 { 1.0 } else { 0.0 };
             }
             true
+        }
+    }
+
+    #[test]
+    fn a_row_keeps_its_id_as_it_moves_back() {
+        for rising in [false, true] {
+            let mut ridge = Ridge::new(RidgeParams { ridge_rising: rising, ..RidgeParams::default() }, 1);
+            ridge.keep_moving = true;
+            let target = RidgeTarget { pixel_width: 2560, pixel_height: 1440, scale: 2.0 };
+            let mut builder = GeometryBuilder::default();
+            let mut list = DrawList::default();
+            let mut now = 5.0;
+            let mut seen: Vec<(u64, Vec<u64>)> = Vec::new();
+            for _ in 0..240 {
+                now += 1.0 / 120.0;
+                ridge.advance(now, Some(&Tone), 720.0);
+                let frame = ridge.frame(now).unwrap();
+                builder.build(Some(&frame), target, &mut list);
+                seen.push((frame.cuts, list.rows.iter().map(|row| row.id).collect()));
+            }
+            let (first_cuts, first) = &seen[120];
+            let (last_cuts, last) = seen.last().unwrap();
+            assert!(last_cuts > first_cuts);
+            // Back to front: the rows behind the live one are the same rows, further back.
+            let behind = &first[first.len() - 4..first.len() - 1];
+            assert!(last.windows(3).any(|ids| ids == behind), "{behind:?} in {last:?}");
+            let live = (*first.last().unwrap(), *last.last().unwrap());
+            if rising {
+                // A rising live row becomes the next history row.
+                assert_eq!(live, (*first_cuts, *last_cuts));
+            } else {
+                assert_eq!(live, (STANDING_ID, STANDING_ID));
+            }
         }
     }
 

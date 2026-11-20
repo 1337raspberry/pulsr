@@ -60,6 +60,8 @@ pub struct RidgeFrame<'a> {
     pub layout: RidgeParams,
     /// Fraction of a row interval the stack has moved since the latest cut (0 to 1).
     pub phase: f64,
+    /// History rows cut so far.
+    pub cuts: u64,
 }
 
 impl RidgeFrame<'_> {
@@ -106,6 +108,8 @@ pub struct Ridge {
     last_step_at: Option<f64>,
     /// Time the latest history row was cut.
     last_row_at: f64,
+    /// History rows cut so far.
+    cuts: u64,
     /// Since when the live line has been flat; `None` while it isn't.
     quiet_since: Option<f64>,
     /// At rest: every row flat and in its slot, no rows being cut.
@@ -142,6 +146,7 @@ impl Ridge {
             scratch: RidgeScratch::default(),
             last_step_at: None,
             last_row_at: 0.0,
+            cuts: 0,
             quiet_since: None,
             idle: false,
             painted_rows: 0,
@@ -287,6 +292,7 @@ impl Ridge {
             edge: &self.taper,
             layout: self.params.clone(),
             phase,
+            cuts: self.cuts,
         })
     }
 
@@ -352,6 +358,7 @@ impl Ridge {
         apply_grain(&self.fine, &mut self.grained, &self.grain, self.params.ridge_grain);
         if let Some(history) = &mut self.history {
             history.push(&self.grained);
+            self.cuts += 1;
         }
         self.random.reroll(&mut self.grain);
     }
