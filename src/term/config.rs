@@ -12,6 +12,9 @@ use super::theme::Theme;
 /// What the keys chose, by setting.
 pub type State = BTreeMap<String, String>;
 
+/// Each theme file with its length and when it was written.
+type ThemeStamp = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
+
 /// A `key = value` line of the settings file.
 #[derive(Debug, PartialEq)]
 pub struct Setting {
@@ -79,6 +82,14 @@ pub fn read(dir: &Path) -> Config {
         }
     }
 
+    let (themes, left_out) = read_themes(dir);
+    config.themes = themes;
+    config.warnings.extend(left_out);
+    config
+}
+
+/// The theme files in `dir`, in the order of their names.
+fn theme_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("themes"))
         .into_iter()
         .flatten()
@@ -87,18 +98,36 @@ pub fn read(dir: &Path) -> Config {
         .filter(|path| path.extension().is_some_and(|extension| extension == "theme"))
         .collect();
     files.sort();
-    for path in files {
+    files
+}
+
+/// Reads the themes in `dir`, and says which were left out and why.
+pub fn read_themes(dir: &Path) -> (Vec<Theme>, Vec<String>) {
+    let (mut themes, mut warnings) = (Vec::new(), Vec::new());
+    for path in theme_files(dir) {
         let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
         let name = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
         let theme = std::fs::read_to_string(&path)
             .map_err(|error| format!("cannot be read: {error}"))
             .and_then(|text| Theme::parse(&name, &text));
         match theme {
-            Ok(theme) => config.themes.push(theme),
-            Err(error) => config.warnings.push(format!("theme {file} left out: {error}")),
+            Ok(theme) => themes.push(theme),
+            Err(error) => warnings.push(format!("theme {file} left out: {error}")),
         }
     }
-    config
+    (themes, warnings)
+}
+
+/// The stamp of the theme files in `dir`: it differs once one is written, added or removed.
+pub fn theme_stamp(dir: &Path) -> ThemeStamp {
+    theme_files(dir)
+        .into_iter()
+        .map(|path| {
+            let data = std::fs::metadata(&path).ok();
+            let (length, written) = data.map_or((0, None), |data| (data.len(), data.modified().ok()));
+            (path, length, written)
+        })
+        .collect()
 }
 
 /// Writes the state file in `dir`, making the directory if need be.
@@ -157,9 +186,37 @@ mod tests {
 
         assert!(config.state.is_empty());
 
+        // A directory that is not there has an empty stamp.
+        assert!(theme_stamp(&dir).is_empty());
+
         // A directory that is not there is no settings and no themes.
         let config = read(&dir);
         assert!(config.settings.is_empty() && config.themes.is_empty() && config.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_theme_file_written_again_shows_in_the_stamp() {
+        let dir = std::env::temp_dir().join(format!("pulsr-stamp-test-{}", std::process::id()));
+        let themes = dir.join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::write(themes.join("dusk.theme"), "gradient dusk = #112233 #445566\n").unwrap();
+        std::fs::write(themes.join("notes.txt"), "not a theme").unwrap();
+        let before = theme_stamp(&dir);
+        assert_eq!(before.len(), 1);
+
+        std::fs::write(themes.join("notes.txt"), "still not a theme").unwrap();
+        assert_eq!(theme_stamp(&dir), before);
+        std::fs::write(themes.join("dusk.theme"), "text = #ffffff\ngradient dusk = #112233 #445566\n").unwrap();
+        let after = theme_stamp(&dir);
+        assert_ne!(after, before);
+        let (read, left_out) = read_themes(&dir);
+        assert_eq!((read.len(), read[0].text, left_out.len()), (1, [255; 3], 0));
+
+        std::fs::write(themes.join("other.theme"), "text = green\n").unwrap();
+        assert_ne!(theme_stamp(&dir), after);
+        let (read, left_out) = read_themes(&dir);
+        assert_eq!((read.len(), left_out.len()), (1, 1));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

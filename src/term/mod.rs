@@ -24,7 +24,7 @@ use crate::{
 };
 use config::Config;
 use raster::Canvas;
-use theme::{Rgb, Theme, Themes};
+use theme::{Reported, Theme, Themes};
 
 pub const USAGE: &str = "\
 pulsr [options]
@@ -50,7 +50,9 @@ Draws what the computer is playing as a ridge, in the terminal.
                 which of the theme's gradients colours the lines, from the
                 flat rows to the peaks: the theme's first by default; each
                 theme has its own, and all have text (the theme's text
-                colour throughout). The G key shows their names
+                colour throughout); terminal also has palette (its own
+                colours, mildest to most vivid) where it reports them.
+                The G key shows their names
   -mode MODE    the characters the ridge is drawn with:
                   octant      solid dots (the default in terminals known
                               to have them)
@@ -92,6 +94,9 @@ themes/NAME.theme adds a theme called NAME. A line of each kind:
   background = #0b1410
   text = #c8d6c0
   gradient atomic = #1f6f4a #39d98a #b8fff0
+
+Theme files written while pulsr runs are read again, and the terminal
+theme follows the terminal's colours as they change.
 
 Keys: Q quits, F switches full screen on and off, T moves to the next
 theme, G to the next gradient, M to the next characters, R lets the
@@ -204,8 +209,17 @@ const DOT_HALF_WIDTH: f32 = 0.5;
 const GRADIENT_TOP: f32 = 0.6;
 /// Seconds the status line stays up after a key changes something.
 const STATUS_SECONDS: f64 = 1.5;
+/// Seconds a warning about a theme file stays up.
+const WARNING_SECONDS: f64 = 3.0;
 /// Seconds to wait for the terminal to report its colours.
 const REPLY_SECONDS: f64 = 0.3;
+/// Seconds after a colour query in which its replies may still be on their way.
+const LATE_REPLY_SECONDS: f64 = 0.25;
+/// Seconds between looks at the theme files and the terminal's colours.
+const COLOUR_POLL: f64 = 1.0;
+/// Asks the terminal for its text and background colours (OSC 10 and 11) and for palette colours 1 to 6 (OSC 4).
+const COLOUR_QUERY: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\
+    \x1b]4;1;?\x1b\\\x1b]4;2;?\x1b\\\x1b]4;3;?\x1b\\\x1b]4;4;?\x1b\\\x1b]4;5;?\x1b\\\x1b]4;6;?\x1b\\";
 
 /// Seconds of nothing but zero samples before the silence notice goes up.
 const SILENCE_SECONDS: f64 = 2.0;
@@ -247,15 +261,30 @@ fn write_notice(notice: &str, cols: u16, theme: &Theme, out: &mut Vec<u8>) {
     let _ = write!(out, " {text}\x1b[0m\r");
 }
 
-/// Asks the terminal for its text and background colours (OSC 10 and 11). The device
-/// attributes query sent last is always answered, which ends the wait. Needs `RawMode`.
-fn terminal_colours() -> (Option<Rgb>, Option<Rgb>) {
-    tty::write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c");
+/// Puts `new` among `themes`, and in place of `theme` if it is that theme. Returns the
+/// gradient to draw in: `wanted` if `theme` has it, else its first.
+fn renew(themes: &mut Themes, theme: &mut Theme, wanted: Option<&str>, new: Theme) -> usize {
+    if new.name == theme.name {
+        *theme = new.clone();
+    }
+    themes.add(new);
+    wanted.and_then(|name| theme.gradient_index(name)).unwrap_or(0)
+}
+
+/// What the terminal has still to say, waited for up to `seconds`. A device attributes
+/// query is always answered, and after everything asked before it. Needs `RawMode`.
+fn replies(seconds: f64) -> Vec<u8> {
+    tty::write_all(b"\x1b[c");
     let answered = |reply: &[u8]| {
         reply.windows(3).position(|window| window == b"\x1b[?").is_some_and(|at| reply[at..].contains(&b'c'))
     };
-    let reply = tty::read_reply(answered, REPLY_SECONDS);
-    theme::reported_colours(&String::from_utf8_lossy(&reply))
+    tty::read_reply(answered, seconds)
+}
+
+/// Asks the terminal for its colours and waits for them. Needs `RawMode`.
+fn terminal_colours() -> Reported {
+    tty::write_all(COLOUR_QUERY);
+    Reported::parse(&String::from_utf8_lossy(&replies(REPLY_SECONDS)))
 }
 
 #[derive(Debug)]
@@ -682,15 +711,19 @@ pub fn run(mut options: Options) -> i32 {
         libc::signal(libc::SIGQUIT, handler);
     }
     let mut screen = Screen::enter();
-    // Dim lines fade toward what is behind them.
-    let (terminal_text, terminal_background) = terminal_colours();
-    let terminal_backdrop = terminal_background.unwrap_or([0; 3]);
+    let mut colours = terminal_colours();
     // The terminal theme draws in the terminal's own text colour.
-    let own = Theme::terminal_reporting(terminal_text, terminal_background);
+    let own = Theme::terminal_reporting(&colours);
     if options.theme.name == own.name {
         options.theme = own.clone();
     }
     options.themes.add(own);
+    // A terminal that reports its colours is asked again as it runs.
+    let mut requery = colours.any();
+    let mut asked = f64::NEG_INFINITY;
+    let mut theme_stamp = options.config_dir.as_deref().map(config::theme_stamp).unwrap_or_default();
+    let mut colours_checked = clock::now();
+    let mut input = tty::Input::default();
 
     // What the terminal is taken to draw, going by its name.
     let terminal =
@@ -698,11 +731,13 @@ pub fn run(mut options: Options) -> i32 {
     let mut mode = options.mode.unwrap_or(terminal);
     let mut full = options.full;
     let mut theme = options.theme.clone();
-    let mut gradient = options.gradient.as_deref().and_then(|name| theme.gradient_index(name)).unwrap_or(0);
+    // The gradient asked for, which the theme may only come to have: `None` is its first.
+    let mut wanted = options.gradient.clone();
+    let mut gradient = wanted.as_deref().and_then(|name| theme.gradient_index(name)).unwrap_or(0);
     let mut state = options.state.clone();
     let mut state_changed = false;
     let mut status_until = f64::NEG_INFINITY;
-    // What the status line says in place of the look: a figure a key changed.
+    // What the status line says in place of the look: a figure a key changed, or a warning.
     let mut figure: Option<String> = None;
     // Every octant only where the terminal is known to draw them all.
     let octant = match terminal {
@@ -734,7 +769,19 @@ pub fn run(mut options: Options) -> i32 {
             break;
         }
         let mut restage = false;
-        for key in tty::presses(&tty::keys()) {
+        let (typed, presses) = input.read(now);
+        // The terminal's answer to a colour query, if it is in.
+        let reported = Reported::parse(&String::from_utf8_lossy(&typed));
+        if reported.any() {
+            requery = true;
+            let merged = colours.with(reported);
+            if merged != colours {
+                colours = merged;
+                let own = Theme::terminal_reporting(&colours);
+                gradient = renew(&mut options.themes, &mut theme, wanted.as_deref(), own);
+            }
+        }
+        for key in presses {
             match key.to_ascii_lowercase() {
                 b'q' => STOP.store(true, Ordering::Relaxed),
                 b'm' => {
@@ -778,8 +825,12 @@ pub fn run(mut options: Options) -> i32 {
                 b't' => {
                     theme = options.themes.next(&theme);
                     gradient = 0;
+                    wanted = None;
                 }
-                b'g' => gradient = (gradient + 1) % theme.gradients.len(),
+                b'g' => {
+                    gradient = (gradient + 1) % theme.gradients.len();
+                    wanted = Some(theme.gradients[gradient].name.clone());
+                }
                 b'[' | b']' => {
                     let step = if key == b']' { 1.0 } else { -1.0 };
                     let (setting, pitch) = options.pitch(mode);
@@ -859,6 +910,23 @@ pub fn run(mut options: Options) -> i32 {
             mode_started = now;
         }
 
+        let recheck = now - colours_checked >= COLOUR_POLL;
+        if recheck {
+            colours_checked = now;
+            let stamp = options.config_dir.as_deref().map(config::theme_stamp).unwrap_or_default();
+            if let Some(dir) = options.config_dir.as_deref().filter(|_| stamp != theme_stamp) {
+                theme_stamp = stamp;
+                let (read, left_out) = config::read_themes(dir);
+                for new in read {
+                    gradient = renew(&mut options.themes, &mut theme, wanted.as_deref(), new);
+                }
+                if let Some(problem) = left_out.into_iter().next() {
+                    figure = Some(problem);
+                    status_until = now + WARNING_SECONDS;
+                }
+            }
+        }
+
         if silence_notice.is_some() && now - silence_checked >= SILENCE_POLL {
             silence_checked = now;
             silence.update(&live.stats(), now);
@@ -884,7 +952,8 @@ pub fn run(mut options: Options) -> i32 {
             gradient: &theme.gradients[gradient],
             top_level: GRADIENT_TOP,
             full: stage.ridge.params.ridge_alpha as f32,
-            backdrop: theme.background.unwrap_or(terminal_backdrop),
+            // Dim lines fade toward what is behind them.
+            backdrop: theme.background.or(colours.background).unwrap_or([0; 3]),
             background: theme.background,
         };
         match mode {
@@ -902,6 +971,10 @@ pub fn run(mut options: Options) -> i32 {
             write_notice(notice, stage.size.cols, &theme, &mut out);
         }
         out.extend_from_slice(b"\x1b[?2026l");
+        if recheck && requery && !STOP.load(Ordering::Relaxed) {
+            out.extend_from_slice(COLOUR_QUERY);
+            asked = now;
+        }
         let encoded = clock::now();
         tty::write_all(&out);
         let written = clock::now();
@@ -922,6 +995,10 @@ pub fn run(mut options: Options) -> i32 {
         }
     }
     report.extend(timings.line(mode, &stage, clock::now() - mode_started));
+    if clock::now() - asked < LATE_REPLY_SECONDS {
+        // Left unread, the replies would be typed at the shell's prompt.
+        replies(LATE_REPLY_SECONDS);
+    }
     drop(screen);
 
     if state_changed

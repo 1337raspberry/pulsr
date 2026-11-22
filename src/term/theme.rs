@@ -319,26 +319,36 @@ pub struct Theme {
     /// `None` leaves the terminal's own background showing.
     pub background: Option<Rgb>,
     pub text: Rgb,
-    /// Never empty. The last is always "text": the text colour throughout.
+    /// Never empty. One is always "text": the text colour throughout.
     pub gradients: Vec<Gradient>,
 }
 
+/// The terminal theme's gradient of the terminal's palette.
+const PALETTE: &str = "palette";
+
 impl Theme {
     /// White lines on the terminal's own background, used until its colours are known.
+    /// Palette is there to be chosen, flat until the terminal reports one.
     pub fn terminal() -> Self {
-        Self::terminal_in([255; 3])
+        let mut theme = Self::terminal_in([255; 3]);
+        theme.gradients.push(Gradient::flat(PALETTE, theme.text));
+        theme
     }
 
     /// Lines in `text` on the terminal's own background.
-    pub fn terminal_in(text: Rgb) -> Self {
+    fn terminal_in(text: Rgb) -> Self {
         Self { name: "terminal".to_string(), background: None, text, gradients: vec![Gradient::flat("text", text)] }
     }
 
     /// Lines in the reported text colour, or failing that white, or black on a light
-    /// background.
-    pub fn terminal_reporting(text: Option<Rgb>, background: Option<Rgb>) -> Self {
-        let light = background.is_some_and(is_light);
-        Self::terminal_in(text.unwrap_or(if light { [0; 3] } else { [255; 3] }))
+    /// background; and a gradient of the terminal's palette where it reports one.
+    pub fn terminal_reporting(reported: &Reported) -> Self {
+        let light = reported.background.is_some_and(is_light);
+        let mut theme = Self::terminal_in(reported.text.unwrap_or(if light { [0; 3] } else { [255; 3] }));
+        if let Some(stops) = palette_stops(&reported.accents, reported.background) {
+            theme.gradients.push(Gradient { name: PALETTE.to_string(), stops });
+        }
+        theme
     }
 
     fn of(scheme: &Scheme) -> Self {
@@ -465,18 +475,70 @@ fn is_light([r, g, b]: Rgb) -> bool {
     u32::from(r) + u32::from(g) + u32::from(b) > 382
 }
 
-/// The text and background colours in a terminal's replies to OSC 10 and OSC 11 queries.
-pub fn reported_colours(reply: &str) -> (Option<Rgb>, Option<Rgb>) {
-    let answer = |code: &str| {
-        let (_, rest) = reply.split_once(&format!("]{code};"))?;
-        reported_colour(rest.split(['\x1b', '\x07']).next()?)
-    };
-    (answer("10"), answer("11"))
+/// How many palette colours are neither black nor white: 1 to 6.
+const ACCENTS: usize = 6;
+
+/// What a terminal reports of its colours.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Reported {
+    pub text: Option<Rgb>,
+    pub background: Option<Rgb>,
+    /// Palette colours 1 to 6.
+    pub accents: [Option<Rgb>; ACCENTS],
 }
 
-/// The colour in a terminal's answer to an OSC 10 or 11 query:
+impl Reported {
+    /// The colours in a terminal's whole replies to OSC 10, 11 and 4 queries.
+    pub fn parse(reply: &str) -> Self {
+        let answer = |code: &str| {
+            let (_, rest) = reply.split_once(&format!("]{code};"))?;
+            reported_colour(rest.split_once(['\x1b', '\x07'])?.0)
+        };
+        Self {
+            text: answer("10"),
+            background: answer("11"),
+            accents: std::array::from_fn(|i| answer(&format!("4;{}", i + 1))),
+        }
+    }
+
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+
+    /// These colours, with `newer`'s where it has them.
+    pub fn with(self, newer: Self) -> Self {
+        Self {
+            text: newer.text.or(self.text),
+            background: newer.background.or(self.background),
+            accents: std::array::from_fn(|i| newer.accents[i].or(self.accents[i])),
+        }
+    }
+}
+
+/// How far a colour is from grey: the spread of its channels.
+fn vividness([r, g, b]: Rgb) -> u8 {
+    r.max(g).max(b) - r.min(g).min(b)
+}
+
+/// A colour drawn on a background differs from it by more than this, summed over its channels.
+const MIN_APART: i32 = 120;
+
+/// A gradient's colours from a palette's: the least vivid, the middling and the most
+/// vivid of those that show on the background. `None` with fewer than three.
+fn palette_stops(accents: &[Option<Rgb>], background: Option<Rgb>) -> Option<[Rgb; 3]> {
+    let apart = |a: &Rgb, b: &Rgb| (0..3).map(|i| (i32::from(a[i]) - i32::from(b[i])).abs()).sum::<i32>();
+    let shows = |colour: &Rgb| background.is_none_or(|behind| apart(colour, &behind) > MIN_APART);
+    let mut colours: Vec<Rgb> = accents.iter().flatten().copied().filter(shows).collect();
+    colours.sort_by_key(|colour| vividness(*colour));
+    match colours[..] {
+        [mildest, _, .., vividest] => Some([mildest, colours[colours.len() / 2], vividest]),
+        _ => None,
+    }
+}
+
+/// The colour in a terminal's answer to an OSC 4, 10 or 11 query:
 /// `rgb:RRRR/GGGG/BBBB`, each part one to four hex digits.
-pub fn reported_colour(reply: &str) -> Option<Rgb> {
+fn reported_colour(reply: &str) -> Option<Rgb> {
     let (_, rest) = reply.split_once("rgb:")?;
     let mut parts = rest.split('/');
     let mut channel = || {
@@ -509,7 +571,7 @@ mod tests {
         let mut theme = Theme::terminal();
         let mut seen = Vec::new();
         for _ in 0..Theme::names().count() {
-            assert_eq!(theme.gradients.last().unwrap().name, "text", "{}", theme.name);
+            assert!(theme.gradient_index("text").is_some(), "{}", theme.name);
             if theme.name != "terminal" {
                 let background = theme.background.unwrap();
                 assert!(theme.gradients.len() >= 4, "{}", theme.name);
@@ -603,18 +665,56 @@ mod tests {
     #[test]
     fn the_terminal_theme_takes_the_terminals_own_text_colour() {
         let both = "\x1b]10;rgb:2222/2222/2222\x1b\\\x1b]11;rgb:f5f5/f5f5/f0f0\x1b\\\x1b[?62;c";
-        assert_eq!(reported_colours(both), (Some([0x22; 3]), Some([0xf5, 0xf5, 0xf0])));
-        assert_eq!(reported_colours("\x1b]11;rgb:00/00/00\x07\x1b[?62;c"), (None, Some([0; 3])));
-        assert_eq!(reported_colours("\x1b[?62;c"), (None, None));
+        let read = Reported::parse(both);
+        assert_eq!((read.text, read.background), (Some([0x22; 3]), Some([0xf5, 0xf5, 0xf0])));
+        assert!(read.any() && read.accents == [None; ACCENTS]);
+        let read = Reported::parse("\x1b]11;rgb:00/00/00\x07\x1b[?62;c");
+        assert_eq!((read.text, read.background), (None, Some([0; 3])));
+        assert!(!Reported::parse("\x1b[?62;c").any());
 
-        let theme = Theme::terminal_reporting(Some([0x22; 3]), Some([0xf5; 3]));
+        let reporting =
+            |text, background| Theme::terminal_reporting(&Reported { text, background, ..Reported::default() });
+        let theme = reporting(Some([0x22; 3]), Some([0xf5; 3]));
         assert_eq!((theme.name.as_str(), theme.text, theme.background), ("terminal", [0x22; 3], None));
         assert_eq!((theme.gradient_names().as_str(), theme.gradients[0].at(1.0)), ("text", [0x22; 3]));
         // With no text colour reported: white, or black on a light
         // background.
-        assert_eq!(Theme::terminal_reporting(None, Some([0xf5; 3])).text, [0; 3]);
-        assert_eq!(Theme::terminal_reporting(None, Some([0x10; 3])).text, [255; 3]);
-        assert_eq!(Theme::terminal_reporting(None, None), Theme::terminal());
+        assert_eq!(reporting(None, Some([0xf5; 3])).text, [0; 3]);
+        assert_eq!(reporting(None, Some([0x10; 3])).text, [255; 3]);
+        // Before any report, palette is there to be asked for.
+        assert_eq!(Theme::terminal().gradient_names(), "text, palette");
+    }
+
+    #[test]
+    fn the_terminals_palette_makes_a_gradient_from_mild_to_vivid() {
+        let reply = "\x1b]11;rgb:0202/0505/0909\x07\x1b]4;1;rgb:8181/3e3e/5959\x07\x1b]4;2;rgb:8888/8e8e/5e5e\x07\
+                     \x1b]4;3;rgb:4646/b5b5/dbdb\x07\x1b]4;4;rgb:dada/8383/5656\x07\x1b]4;5;rgb:e5e5/2f2f/4242\x07\
+                     \x1b]4;6;rgb:d4d4/c7c7/3838\x1b\\";
+        let read = Reported::parse(reply);
+        assert_eq!((read.accents[0], read.accents[5]), (Some([0x81, 0x3e, 0x59]), Some([0xd4, 0xc7, 0x38])));
+        let theme = Theme::terminal_reporting(&read);
+        assert_eq!(theme.gradient_names(), "text, palette");
+        let palette = &theme.gradients[1];
+        // Olive is the nearest to grey, red the furthest from it.
+        assert_eq!(
+            (palette.at(0.0), palette.at(0.5), palette.at(1.0)),
+            ([0x88, 0x8e, 0x5e], [0x46, 0xb5, 0xdb], [0xe5, 0x2f, 0x42])
+        );
+
+        // A colour that would not show on the background is passed over.
+        let accents = [Some([10, 5, 20]), Some([200, 0, 0]), Some([0, 150, 150]), Some([90, 90, 60]), None, None];
+        let hidden = Reported { accents, ..read };
+        assert_eq!(Theme::terminal_reporting(&hidden).gradients[1].at(0.0), [90, 90, 60]);
+        // Fewer than three colours are not a gradient.
+        let few = Reported { accents: [Some([200, 0, 0]), Some([0, 150, 150]), None, None, None, None], ..read };
+        assert_eq!(Theme::terminal_reporting(&few).gradient_names(), "text");
+
+        // A reply cut short is not read.
+        assert!(!Reported::parse("\x1b]11;rgb:1e1e/1e1e/2").any());
+
+        // A later report changes only what it names.
+        let later = read.with(Reported { text: Some([1, 2, 3]), ..Reported::default() });
+        assert_eq!((later.text, later.background, later.accents), (Some([1, 2, 3]), read.background, read.accents));
     }
 
     #[test]
